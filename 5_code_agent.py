@@ -54,7 +54,7 @@ files, edit files, or run JavaScript with Node.js.
 Important behavior:
 - When creating a file, call write_file with the complete file content.
 - When changing an existing file, call edit_file with an exact old_str and new_str.
-- After creating or editing a runnable JavaScript file, call run_node_file to verify it.
+- When the user asks you to run or verify a JavaScript file, call run_node_file.
 - Do not say the task is complete until the relevant tool calls have succeeded.
 """.strip()
 
