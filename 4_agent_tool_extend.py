@@ -8,44 +8,36 @@
 
 from __future__ import annotations
 
-import json
-import os
 from collections.abc import Callable
-from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
-from dotenv import load_dotenv
-from openai import OpenAI
 from openai.types.chat import (
     ChatCompletion,
     ChatCompletionMessageParam,
-    ChatCompletionToolParam,
 )
 
-# .env 파일에서 OPENROUTER_API_KEY를 읽어옵니다.
-load_dotenv()
+from agent_lib.console import (
+    get_user_message,
+    print_chat_banner,
+    print_error,
+    print_llm_message,
+    print_no_response,
+    print_user_prompt,
+)
+from agent_lib.core import (
+    ToolDefinition,
+    append_tool_result_message,
+    append_user_message,
+    parse_tool_arguments,
+    run_tool,
+    to_openai_tools,
+)
+from agent_lib.llm import ChatModel, new_chat_model
 
-# LLM 호출과 파일 입출력에 필요한 공통 설정입니다.
-LLM_API_KEY_NAME = "OPENROUTER_API_KEY"
-MODEL_NAME = "poolside/laguna-m.1:free"  # OpenRouter free model
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+# LLM provider 생성과 fallback 설정은 agent_lib/llm.py에 모아 두고, 여기에는 파일 입출력
+# 설정만 남깁니다.
 DEFAULT_ENCODING = "utf-8"
-
-# 터미널 출력에서 사용자, 모델, 도구 실행 로그를 구분하기 위한 색상입니다.
-COLOR_USER = "\033[94m"     # Blue
-COLOR_LLM = "\033[93m"      # Yellow
-COLOR_TOOL = "\033[92m"     # Green
-COLOR_RESET = "\033[0m"
-
-
-@dataclass
-class ToolDefinition:
-    """LLM에게 보여줄 도구 정보와 실제 실행 함수를 연결합니다."""
-
-    name: str
-    description: str
-    input_schema: dict[str, Any]
-    function: Callable[[dict[str, Any]], str]
 
 
 def read_file(input_data: dict[str, Any]) -> str:
@@ -90,10 +82,10 @@ def list_dir(input_data: dict[str, Any]) -> str:
     if not isinstance(path, str):
         raise ValueError("Path must be a string.")
     
-    # os.listdir은 파일 이름만 반환합니다. 여기서는 간단한 예제이므로
+    # Path.iterdir는 파일 이름만 쉽게 꺼낼 수 있습니다. 여기서는 간단한 예제이므로
     # 파일인지 디렉터리인지 같은 추가 메타데이터는 붙이지 않습니다.
-    files = os.listdir(path)
-    return "\n".join(files)
+    entries = Path(path).iterdir()
+    return "\n".join(sorted(entry.name for entry in entries))
 
 
 # path는 선택값입니다. 모델이 path를 생략하면 현재 디렉터리(".")를 조회합니다.
@@ -120,12 +112,9 @@ LIST_DIR_DEFINITION = ToolDefinition(
 
 def create_new_file(file_path: str, content: str) -> str:
     """없는 파일을 만들 때 사용하는 내부 헬퍼 함수입니다."""
-    directory = os.path.dirname(file_path)
-    if directory and not os.path.exists(directory):
-        # 하위 폴더까지 한 번에 만들 수 있도록 exist_ok=True를 사용합니다.
-        os.makedirs(directory, exist_ok=True)
-    with open(file_path, "w", encoding=DEFAULT_ENCODING) as file:
-        file.write(content)
+    path = Path(file_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding=DEFAULT_ENCODING)
     return f"Successfully created file {file_path}"
 
 
@@ -143,8 +132,7 @@ def edit_file(input_data: dict[str, Any]) -> str:
         raise ValueError("Invalid input parameters: old_str and new_str must be different.")
 
     try:
-        with open(path, "r", encoding=DEFAULT_ENCODING) as file:
-            content = file.read()
+        content = Path(path).read_text(encoding=DEFAULT_ENCODING)
     except FileNotFoundError:
         if old_str == "":
             # old_str이 빈 문자열이고 파일이 없으면 "수정" 대신 새 파일 생성으로 봅니다.
@@ -158,8 +146,7 @@ def edit_file(input_data: dict[str, Any]) -> str:
     if content == new_content and old_str != "":
         raise ValueError("old_str not found in file")
 
-    with open(path, "w", encoding=DEFAULT_ENCODING) as file:
-        file.write(new_content)
+    Path(path).write_text(new_content, encoding=DEFAULT_ENCODING)
 
     return "OK"
 
@@ -202,12 +189,12 @@ class Agent:
 
     def __init__(
         self,
-        client: OpenAI,
+        chat_model: ChatModel,
         get_user_message: Callable[[], tuple[str, bool]],
         tools: list[ToolDefinition],
     ) -> None:
         # 이 리스트가 커질수록 모델이 사용할 수 있는 행동도 늘어납니다.
-        self.client = client
+        self.chat_model = chat_model
         self.get_user_message = get_user_message
         self.tools = tools
     
@@ -218,29 +205,29 @@ class Agent:
         # conversation으로 모델을 다시 호출해야 합니다.
         read_user_input = True
 
-        print("Chat with OpenRouter. use ctrl-c to quit.")
+        print_chat_banner()
         
         while True:
             if read_user_input:
-                print(f"{COLOR_USER}You{COLOR_RESET}: ", end="")
+                print_user_prompt()
 
                 user_input, is_input_valid = self.get_user_message()
                 if not is_input_valid:
                     break
 
-                self._add_user_message(conversation, user_input)
+                append_user_message(conversation, user_input)
 
             response = self.run_inference(conversation)
 
             if not response.choices:
-                print("No response from OpenRouter.")
+                print_no_response()
                 continue
             
             model_message = response.choices[0].message
             conversation.append(model_message.model_dump(exclude_none=True))
 
             if model_message.content:
-                print(f"{COLOR_LLM}LLM{COLOR_RESET}: {model_message.content}")
+                print_llm_message(model_message.content)
 
             if not model_message.tool_calls:
                 read_user_input = True
@@ -250,18 +237,6 @@ class Agent:
             self._execute_and_append_tool_calls(conversation, model_message.tool_calls)
             read_user_input = False
 
-    def _add_user_message(
-        self,
-        conversation: list[ChatCompletionMessageParam],
-        user_input: str,
-    ) -> None:
-        """사용자 메시지를 Chat Completions API 형식으로 추가합니다."""
-        user_message: ChatCompletionMessageParam = {
-            "role": "user",
-            "content": user_input,
-        }
-        conversation.append(user_message)
-
     def _execute_and_append_tool_calls(
         self,
         conversation: list[ChatCompletionMessageParam],
@@ -270,124 +245,50 @@ class Agent:
         """tool_call을 실제 함수 실행으로 바꾸고 결과를 tool 메시지로 기록합니다."""
         for tool_call in tool_calls:
             tool_name = tool_call.function.name
-            tool_args_str = tool_call.function.arguments
-            
-            # 모델이 준 arguments는 JSON 문자열입니다. 잘못된 JSON이면 빈 입력으로
-            # 도구를 실행해 에러 메시지를 conversation에 남기게 합니다.
-            try:
-                tool_args = json.loads(tool_args_str) if tool_args_str else {}
-            except (json.JSONDecodeError, TypeError):
-                tool_args = {}
+            tool_args = parse_tool_arguments(tool_call)
 
-            tool_response, is_error = self.execute_tool(
+            tool_response, is_error = run_tool(
+                tools=self.tools,
                 name=tool_name,
                 input_data=tool_args,
             )
             
             # tool_call_id는 모델의 요청과 우리가 돌려주는 결과를 연결하는 식별자입니다.
-            tool_message: ChatCompletionMessageParam = {
-                "role": "tool",
-                "tool_call_id": tool_call.id,
-                "name": tool_name,
-                "content": json.dumps({
-                    "result": tool_response,
-                    "is_error": is_error,
-                }),
-            }
-            conversation.append(tool_message)
-
-    def to_openai_tools(self) -> list[ChatCompletionToolParam]:
-        """등록된 ToolDefinition들을 OpenAI tools 파라미터 형식으로 변환합니다."""
-        if not self.tools:
-            return []
-        
-        openai_tools: list[ChatCompletionToolParam] = []
-        for tool in self.tools:
-            openai_tools.append({
-                "type": "function",
-                "function": {
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters": tool.input_schema,
-                }
-            })
-        return openai_tools
-
-    def execute_tool(
-        self,
-        name: str,
-        input_data: dict[str, Any],
-    ) -> tuple[str, bool]:
-        """도구 이름으로 ToolDefinition을 찾고 실행 결과와 에러 여부를 반환합니다."""
-        tool_def: ToolDefinition | None = None
-
-        # 간단한 예제라 선형 탐색을 사용합니다. 도구가 많아지면 dict 매핑으로
-        # 바꿔도 됩니다.
-        for tool in self.tools:
-            if tool.name == name:
-                tool_def = tool
-                break
-        
-        if tool_def is None:
-            return "tool not found", True
-        
-        print(f"{COLOR_TOOL}tool{COLOR_RESET}: {name}({input_data})")
-
-        try:
-            response = tool_def.function(input_data)
-            return response, False
-        except Exception as error:
-            return str(error), True
+            append_tool_result_message(
+                conversation=conversation,
+                tool_call=tool_call,
+                tool_name=tool_name,
+                tool_response=tool_response,
+                is_error=is_error,
+            )
 
     def run_inference(
         self,
         conversation: list[ChatCompletionMessageParam]
     ) -> ChatCompletion:
         """대화 기록과 도구 목록을 모델에게 보내 다음 응답을 받습니다."""
-        openai_tools = self.to_openai_tools()
-
-        kwargs: dict[str, Any] = {
-            "model": MODEL_NAME,
-            "messages": conversation,
-        }
-        if openai_tools:
-            kwargs["tools"] = openai_tools
-
-        response = self.client.chat.completions.create(**kwargs)
-        return response
-
-
-def get_user_message() -> tuple[str, bool]:
-    """터미널 한 줄 입력을 읽고, 종료 신호면 False를 반환합니다."""
-    try:
-        text = input()
-        return text, True
-    except (EOFError, KeyboardInterrupt):
-        return "", False
+        return self.chat_model.complete(
+            messages=conversation,
+            tools=to_openai_tools(self.tools),
+        )
 
 
 def new_agent(
-    client: OpenAI,
+    chat_model: ChatModel,
     get_user_msg_fn: Callable[[], tuple[str, bool]],
     tools: list[ToolDefinition],
 ) -> Agent:
     """main 함수에서 Agent 생성 세부사항을 숨기는 팩토리 함수입니다."""
     return Agent(
-        client=client,
+        chat_model=chat_model,
         get_user_message=get_user_msg_fn,
         tools=tools
     )
 
 
 def main() -> None:
-    """환경 설정, 클라이언트 생성, 도구 등록, Agent 실행을 담당합니다."""
-    if not os.getenv(LLM_API_KEY_NAME):
-        raise RuntimeError(f"Missing {LLM_API_KEY_NAME}.")
-    
-    client = OpenAI(
-        base_url=OPENROUTER_BASE_URL,
-        api_key=os.getenv(LLM_API_KEY_NAME),
-    )
+    """LLM provider 생성, 도구 등록, Agent 실행을 담당합니다."""
+    chat_model = new_chat_model()
     
     # 4단계에서는 읽기, 목록 보기, 파일 생성/수정 도구를 함께 제공합니다.
     tools: list[ToolDefinition] = [
@@ -396,7 +297,7 @@ def main() -> None:
         EDIT_FILE_DEFINITION,
     ]
     agent = new_agent(
-        client=client,
+        chat_model=chat_model,
         get_user_msg_fn=get_user_message,
         tools=tools,    
     )
@@ -404,7 +305,7 @@ def main() -> None:
     try:
         agent.run()
     except Exception as error:
-        print(f"Error: {error}")
+        print_error(error)
 
 
 if __name__ == "__main__":

@@ -11,3 +11,7 @@ wheels/
 
 # Local environment variables
 .env
+
+# Local agent notes
+AGENTS.md
+docs/exec-plan
