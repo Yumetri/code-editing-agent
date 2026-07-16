@@ -735,3 +735,14 @@ node --version
 ```
 
 Node.js가 없다면 `run_node_file` 도구는 실패합니다.
+
+## 참고와 변형
+
+이 튜토리얼은 Thorsten Ball의 [How to Build an Agent](https://ampcode.com/notes/how-to-build-an-agent)에서
+설명한 Go 기반 코드 편집 에이전트의 설계와 예제 흐름을 참고했습니다.
+
+원문은 Go와 Anthropic SDK를 중심으로 conversation, tool 정의, 파일 읽기/수정,
+실행 검증으로 확장하는 과정을 보여줍니다. 이 저장소는 그 흐름을 Python으로
+리팩토링하고, 0-5단계의 실험 단위로 더 세분화했습니다. 또한 OpenRouter/Gemini
+provider DI, Gemini fallback, logging, 공통 모듈 분리, pytest 기반 테스트를
+추가해 학습과 수정이 쉽도록 구성했습니다.
